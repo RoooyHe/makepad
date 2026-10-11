@@ -11,6 +11,7 @@ use crate::{
 
 // `vm.host.cx_mut()` — reach the host Cx from a script helper.
 use crate::makepad_draw::makepad_platform::script::vm::ScriptVmCx;
+use makepad_script::vm::ScriptErrorRecord;
 
 // `sys.dataset` and `sys.news_digest`: they share this module's helpers.
 #[path = "splash_dataset.rs"]
@@ -520,7 +521,63 @@ fn restore_modules(vm: &mut ScriptVm, saved: Vec<(LiveId, ScriptValue, Option<Sc
 /// not heap growth, so a hostile script can still allocate aggressively within
 /// its budget; and top-level side effects (e.g. `start_interval`) run and live
 /// until the marked-dead isolate is reclaimed by `gc_dead_splash_isolates`.
+/// Validate a card or app body without a live host, and return the errors as
+/// text. [`validate_splash_body_records`] is the same check with each error's
+/// location and message apart, which is what an editor or a linter needs:
+/// `loc` carries the line and column, `message` is the text without its
+/// location or the interpreter's origin.
+///
+/// The reported line is ahead of the body's own file by
+/// [`SPLASH_PREFIX_LINES`] (or [`SPLASH_NET_PREFIX_LINES`] with `allow_net`),
+/// because the body is evaluated inside the harness prefix. Subtract it to get
+/// the line in the `.splash` source.
 pub fn validate_splash_body(cx: &mut Cx, body: &str, allow_net: bool) -> Vec<String> {
+    validate_splash_body_records(cx, body, allow_net)
+        .into_iter()
+        .map(|record| record.text)
+        .collect()
+}
+
+/// Map a location in the evaluated source back to the body's own file.
+///
+/// Two adjustments, both of which an editor needs and neither of which it can
+/// make for itself:
+///
+/// * `ScriptLoc`'s line and column are **0-based** — the tokenizer counts from
+///   zero — so the app's own line is `line - the prefix's newlines + 1`.
+/// * The body's FIRST line shares a physical line with the prefix's tail
+///   (`View{height:Fit, `), so a column on it is ahead by that tail's width.
+///
+/// A location inside the prefix itself is the harness's own; it is reported as
+/// 1:1 rather than as a zero or a negative.
+///
+/// The returned column is the VM's, which points at the token the interpreter
+/// was at — often the property's key or the enclosing statement rather than
+/// the name in the message. Callers that want the name's own column refine it
+/// against the line's text; see `splashcheck`.
+pub fn body_location(line: u32, column: u32, allow_net: bool) -> (usize, usize) {
+    let (prefix, newlines) = if allow_net {
+        (SPLASH_NET_PREFIX, SPLASH_NET_PREFIX_LINES)
+    } else {
+        (SPLASH_PREFIX, SPLASH_PREFIX_LINES)
+    };
+    if line < newlines {
+        // Inside the prefix: the harness's own line, not the app's.
+        return (1, column as usize + 1);
+    }
+    let body_line = (line - newlines + 1) as usize;
+    let body_column = if line == newlines {
+        // The body's first line continues the prefix's last one.
+        let shared = prefix.rsplit('\n').next().unwrap_or("").chars().count() as u32;
+        column.saturating_sub(shared) as usize + 1
+    } else {
+        column as usize + 1
+    };
+    (body_line, body_column.max(1))
+}
+
+/// [`validate_splash_body`] with each error's location and message apart.
+pub fn validate_splash_body_records(cx: &mut Cx, body: &str, allow_net: bool) -> Vec<ScriptErrorRecord> {
     let vm_id = cx.alloc_splash_vm_with_network(allow_net);
     // Give the dry run a throwaway storage jail so top-level `fs.read` boot
     // loads validate instead of erroring "storage not available". The path is
@@ -558,7 +615,9 @@ pub fn validate_splash_body(cx: &mut Cx, body: &str, allow_net: bool) -> Vec<Str
         code: String::new(),
         values: vec![],
     };
-    let mut errors_out = vec!["the script crashed its isolate during validation".to_string()];
+    let mut errors_out = vec![ScriptErrorRecord::from(
+        "the script crashed its isolate during validation".to_string(),
+    )];
     crate::widget_async::contain_isolate_panic("validation eval", || {
     errors_out = cx.with_script_vm_id(vm_id, |vm| {
         // Capture instead of logging: mid-eval errors otherwise go straight to
@@ -567,15 +626,15 @@ pub fn validate_splash_body(cx: &mut Cx, body: &str, allow_net: bool) -> Vec<Str
         let value = vm.with_instruction_limit(SPLASH_EVAL_INSTRUCTION_LIMIT, |vm| {
             vm.eval_with_append_source(script_mod, &code, NIL.into())
         });
-        let mut errors = vm.take_errors();
+        let mut errors = vm.take_error_records();
         if errors.is_empty() {
             if value.is_err() {
-                errors.push("script evaluated to an error".to_string());
+                errors.push(ScriptErrorRecord::from("script evaluated to an error".to_string()));
             } else if value.as_object().is_none() {
-                errors.push(
+                errors.push(ScriptErrorRecord::from(
                     "script has no root widget (e.g. View{...}) as its final expression"
                         .to_string(),
-                );
+                ));
             }
         }
         errors

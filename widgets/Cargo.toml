@@ -53,3 +53,10 @@ appcard = []
 
 ## Enables certain public-facing types to derive serde serialization traits.
 serde = ["dep:serde", "makepad-draw/serde", "makepad-derive-widget/serde"]
+
+[[bin]]
+# splashcheck: static semantic analysis of a user-written Splash app. It lives
+# here because the validator it runs (splash::validate_splash_body_records) and
+# the host bridge it reads are this crate's: one revision, no skew.
+name = "splashcheck"
+path = "src/bin/splashcheck.rs"

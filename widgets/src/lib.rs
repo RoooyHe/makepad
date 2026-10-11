@@ -118,6 +118,7 @@ pub mod math_view;
 #[cfg(feature = "pdf")]
 pub mod pdf_view;
 pub mod splash;
+pub mod splashcheck;
 pub mod svg;
 pub mod vector;
 

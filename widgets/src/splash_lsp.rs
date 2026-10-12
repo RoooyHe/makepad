@@ -117,6 +117,14 @@ impl Server {
                 let uri = string_field(&params.get("textDocument").cloned().unwrap_or(Value::Null), "uri");
                 vec![response(id, Value::Array(self.code_actions(&uri, &params)))]
             }
+            "textDocument/definition" => {
+                let uri = string_field(&params.get("textDocument").cloned().unwrap_or(Value::Null), "uri");
+                vec![response(id, self.definitions(&uri, &params))]
+            }
+            "textDocument/documentSymbol" => {
+                let uri = string_field(&params.get("textDocument").cloned().unwrap_or(Value::Null), "uri");
+                vec![response(id, self.document_symbols(&uri))]
+            }
             other => {
                 // A request we do not implement is answered; a notification we
                 // do not know is dropped, as the protocol requires.
@@ -241,6 +249,137 @@ impl Server {
         }
         actions
     }
+
+    /// Where a name is declared, for go-to-definition.
+    ///
+    /// A textual scan, and honestly so: the VM holds the real scopes but
+    /// exposes no "where is this name declared" query, and a DSL whose only
+    /// binding forms are `let`, `fn` and `:=` is one where the text is nearly
+    /// the truth. Every declaration of the name is returned, because a `let`
+    /// inside a block shadows and the reader can pick.
+    fn definitions(&self, uri: &str, params: &Value) -> Value {
+        let Some(document) = self.documents.get(uri) else {
+            return Value::Null;
+        };
+        let Some(range) = params.get("range") else {
+ return Value::Null;
+        };
+        let line = range.get("start").and_then(|s| s.get("line")).and_then(|l| l.as_u64()).unwrap_or(0) as usize;
+        let character = range.get("start").and_then(|s| s.get("character")).and_then(|c| c.as_u64()).unwrap_or(0) as usize;
+        let Some(text) = document.text.lines().nth(line) else {
+            return Value::Null;
+        };
+        let Some((word, _)) = word_at(text, character) else {
+            return Value::Null;
+        };
+        let found: Vec<Value> = declarations(&document.text)
+            .into_iter()
+            .filter(|symbol| symbol.name == word)
+            .map(|symbol| {
+                json!({
+                    "uri": uri,
+                    "range": {
+                        "start": {"line": symbol.line, "character": symbol.column},
+                        "end": {"line": symbol.line, "character": symbol.column + symbol.name.chars().count()},
+                    }
+                })
+            })
+            .collect();
+        if found.is_empty() {
+            Value::Null
+        } else {
+            Value::Array(found)
+        }
+    }
+
+    /// The document's declarations, for the outline view.
+    fn document_symbols(&self, uri: &str) -> Value {
+        let Some(document) = self.documents.get(uri) else {
+            return Value::Array(Vec::new());
+        };
+        Value::Array(
+            declarations(&document.text)
+                .into_iter()
+                .map(|symbol| {
+                    json!({
+                        "name": symbol.name,
+                        "kind": symbol.kind,
+                        "location": {
+                            "uri": uri,
+                            "range": {
+                                "start": {"line": symbol.line, "character": symbol.column},
+                                "end": {"line": symbol.line, "character": symbol.column + symbol.name.chars().count()},
+                            }
+                        },
+                    })
+                })
+                .collect::<Vec<Value>>(),
+        )
+    }
+}
+
+/// What a declaration is, in LSP's symbol kinds.
+pub const SYMBOL_FUNCTION: u64 = 12;
+pub const SYMBOL_VARIABLE: u64 = 13;
+
+/// One binding a document declares.
+#[derive(Clone, Debug)]
+pub struct Symbol {
+    pub name: String,
+    /// 0-based, as LSP wants.
+    pub line: usize,
+    /// 0-based character offset.
+    pub column: usize,
+    pub kind: u64,
+}
+
+/// Every binding a document declares: `let name = …`, `fn name(…)`, and
+/// `name := …` (a named child or property, the DSL's third binding form).
+///
+/// A `for` binder is deliberately not one: it is scoped to its own loop, and
+/// offering to jump to it from outside would be wrong.
+pub fn declarations(source: &str) -> Vec<Symbol> {
+    let mut out = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        let start = line.len() - line.trim_start().len();
+        let indent = line[..start].chars().count();
+        let trimmed = &line[start..];
+        for (kind, keyword) in [(SYMBOL_VARIABLE, "let"), (SYMBOL_FUNCTION, "fn")] {
+            let Some(rest) = trimmed.strip_prefix(keyword) else { continue };
+            // A keyword is a whole word: `letter` does not begin with `let`.
+            if !rest.starts_with(|c: char| c.is_whitespace()) {
+                continue;
+            }
+            let after = rest.trim_start();
+            let column = indent + keyword.chars().count() + (rest.chars().count() - after.chars().count());
+            if let Some(name) = leading_identifier(after) {
+                out.push(Symbol { name, line: index, column, kind });
+            }
+        }
+        // `name := …`, whether it starts the line or sits inside a constructor.
+        if let Some(at) = line.find(":=") {
+            if let Some((name, column)) = trailing_identifier(&line[..at]) {
+                out.push(Symbol { name, line: index, column, kind: SYMBOL_VARIABLE });
+            }
+        }
+    }
+    out
+}
+
+/// The identifier at the start of `text`.
+fn leading_identifier(text: &str) -> Option<String> {
+    let end = text.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(text.len());
+    let name = &text[..end];
+    (!name.is_empty() && name.starts_with(|c: char| c.is_alphabetic() || c == '_')).then(|| name.to_owned())
+}
+
+/// The identifier that ends `text` — the name before a `:=` — and its column.
+fn trailing_identifier(text: &str) -> Option<(String, usize)> {
+    let trimmed = text.trim_end();
+    let start = trimmed.rfind(|c: char| !(c.is_alphanumeric() || c == '_')).map(|at| at + 1).unwrap_or(0);
+    let name = &trimmed[start..];
+    (!name.is_empty() && name.starts_with(|c: char| c.is_alphabetic() || c == '_'))
+        .then(|| (name.to_owned(), trimmed[..start].chars().count()))
 }
 
 fn initialize_result() -> Value {
@@ -248,6 +387,8 @@ fn initialize_result() -> Value {
         "capabilities": {
             "textDocumentSync": 1,
             "codeActionProvider": true,
+            "definitionProvider": true,
+            "documentSymbolProvider": true,
             "serverInfo": {"name": "splash-lsp", "version": env!("CARGO_PKG_VERSION")},
         }
     })
@@ -521,6 +662,91 @@ mod tests {
         assert_eq!(edit["range"]["start"]["line"], 1);
         assert_eq!(edit["range"]["start"]["character"], 4);
         assert_eq!(edit["range"]["end"]["character"], 16, "the whole name is replaced: 4 + NoSuchWidget");
+    }
+
+    #[test]
+    fn declarations_finds_every_binding_form() {
+        let source = "let state = {items: []}\nfn load(){ }\n\nView{\n    title := Label{text: \"x\"}\n    Card{body.text: state}\n}\n";
+        let found = declarations(source);
+        let named: Vec<(&str, usize, usize, u64)> =
+            found.iter().map(|s| (s.name.as_str(), s.line, s.column, s.kind)).collect();
+        assert_eq!(
+            named,
+            vec![
+                ("state", 0, 4, SYMBOL_VARIABLE),
+                ("load", 1, 3, SYMBOL_FUNCTION),
+                ("title", 4, 4, SYMBOL_VARIABLE),
+            ],
+            "let, fn and :=, each at its own 0-based line and character"
+        );
+    }
+
+    #[test]
+    fn a_for_binder_is_not_a_declaration() {
+        // It is scoped to its own loop; offering to jump to it from outside
+        // would be wrong.
+        let source = "for item in items { Label{text: item} }\nlet items = []\n";
+        let found = declarations(source);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].name, "items");
+    }
+
+    #[test]
+    fn a_keyword_is_a_whole_word() {
+        let source = "let letters = 1\nlet fnord = 2\n";
+        let found = declarations(source);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].name, "letters");
+        assert_eq!(found[1].name, "fnord");
+    }
+
+    #[test]
+    fn a_definition_request_returns_the_declaration() {
+        let mut server = server();
+        let uri = "file:///C:/app/bundle/main.splash";
+        open(
+            &mut server,
+            uri,
+            "let state = {items: []}\n\nfn load(){ }\n\nView{\n    width: Fill\n    on_render: fn(){ load() }\n    body := Label{text: \"x\"}\n}\n",
+        );
+        // The cursor on `load`, inside the handler on line 6 (0-based).
+        let replies = server.handle(&json!({
+            "jsonrpc":"2.0","id":11,"method":"textDocument/definition",
+            "params":{"textDocument":{"uri":uri},"range":{"start":{"line":6,"character":22}}}
+        }));
+        let locations = replies[0]["result"].as_array().expect("a location array");
+        assert_eq!(locations.len(), 1, "{locations:?}");
+        assert_eq!(locations[0]["uri"], uri);
+        assert_eq!(locations[0]["range"]["start"]["line"], 2, "the fn's own line");
+        assert_eq!(locations[0]["range"]["start"]["character"], 3);
+    }
+
+    #[test]
+    fn a_definition_for_a_name_nothing_declares_is_null() {
+        let mut server = server();
+        let uri = "file:///C:/app/bundle/main.splash";
+        open(&mut server, uri, "View{ Label{text: \"x\"} }\n");
+        let replies = server.handle(&json!({
+            "jsonrpc":"2.0","id":12,"method":"textDocument/definition",
+            "params":{"textDocument":{"uri":uri},"range":{"start":{"line":0,"character":7}}}
+        }));
+        assert!(replies[0]["result"].is_null(), "{}", replies[0]);
+    }
+
+    #[test]
+    fn the_outline_lists_the_declarations() {
+        let mut server = server();
+        let uri = "file:///C:/app/bundle/main.splash";
+        open(&mut server, uri, "let a = 1\nfn b(){ }\nView{ c := Label{text: \"x\"} }\n");
+        let replies = server.handle(&json!({
+            "jsonrpc":"2.0","id":13,"method":"textDocument/documentSymbol",
+            "params":{"textDocument":{"uri":uri}}
+        }));
+        let symbols = replies[0]["result"].as_array().expect("symbols");
+        let names: Vec<&str> = symbols.iter().map(|s| s["name"].as_str().expect("name")).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+        assert_eq!(symbols[0]["kind"], SYMBOL_VARIABLE);
+        assert_eq!(symbols[1]["kind"], SYMBOL_FUNCTION);
     }
 
     #[test]

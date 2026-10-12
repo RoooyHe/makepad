@@ -194,6 +194,42 @@ fn a_session_answers_initialize_and_publishes_findings() {
     assert!(reply.contains("Replace with '"), "{reply}");
     assert!(reply.contains("\"newText\""), "{reply}");
 
+    session.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "textDocument/definition",
+            "params": {
+                "textDocument": {"uri": uri},
+                "range": {"start": {"line": 4, "character": 4}},
+                "context": {"diagnostics": []},
+            },
+        })
+        .to_string(),
+    );
+    let reply = session.next(Duration::from_secs(10)).expect("the definition reply");
+    let value: serde_json::Value = serde_json::from_str(&reply).expect("json");
+    let locations = value["result"].as_array().expect("a location array");
+    assert_eq!(locations.len(), 1, "{reply}");
+    // `fn load()` is on line 4 (0-based); the jump lands on its own name.
+    assert_eq!(locations[0]["range"]["start"]["line"], 4, "{reply}");
+    assert_eq!(locations[0]["range"]["start"]["character"], 3, "{reply}");
+
+    session.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "textDocument/documentSymbol",
+            "params": {"textDocument": {"uri": uri}},
+        })
+        .to_string(),
+    );
+    let reply = session.next(Duration::from_secs(10)).expect("the documentSymbol reply");
+    let value: serde_json::Value = serde_json::from_str(&reply).expect("json");
+    let names: Vec<&str> = value["result"].as_array().expect("symbols").iter()
+        .map(|s| s["name"].as_str().expect("name")).collect();
+    assert_eq!(names, vec!["load"], "{reply}");
+
     session.send(r#"{"jsonrpc":"2.0","id":3,"method":"shutdown"}"#);
     let reply = session.next(Duration::from_secs(10)).expect("the shutdown reply");
     assert!(reply.contains("\"result\":null"), "{reply}");

@@ -119,6 +119,7 @@ pub mod math_view;
 pub mod pdf_view;
 pub mod splash;
 pub mod splashcheck;
+pub mod splash_lsp;
 pub mod svg;
 pub mod vector;
 

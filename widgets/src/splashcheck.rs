@@ -391,8 +391,10 @@ fn scan_dir(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// Checks one app file.
-fn check_file(path: &Path, inv: &Invocation, cx: &mut crate::Cx) -> FileReport {
+/// Checks one app file. [`run`] is the command-line entry; this is the one-file
+/// form a host embedding the checker would call — which is what the language
+/// server does, once per document.
+pub fn check_file(path: &Path, inv: &Invocation, cx: &mut crate::Cx) -> FileReport {
     let mut report = FileReport::new(path);
     let source = match fs::read_to_string(path) {
         Ok(source) => source,
@@ -401,6 +403,15 @@ fn check_file(path: &Path, inv: &Invocation, cx: &mut crate::Cx) -> FileReport {
             return report;
         }
     };
+    check_source(path, &source, inv, cx)
+}
+
+/// Check a source that is already in hand — an editor's buffer, or a caller
+/// that read the file itself. `path` is only used to find the app's bundle, so
+/// an unsaved document in a bundle on disk is still checked against that
+/// bundle's declarations, which is the whole point for an editor.
+pub fn check_source(path: &Path, source: &str, inv: &Invocation, cx: &mut crate::Cx) -> FileReport {
+    let mut report = FileReport::new(path);
     report.bytes = source.len();
 
     // The bundle this file belongs to. Without one there is nothing to check
@@ -536,8 +547,41 @@ pub fn named_in_message(message: &str) -> Option<String> {
     None
 }
 
-/// The 0-based column of a whole-word occurrence of `name` in `line`.
-fn find_word(line: &str, name: &str) -> Option<usize> {
+/// The names a validator message offers instead of the one it refused.
+///
+/// The VM appends `Did you mean: A(obj123) or B(fn45), C(nil) (+12 more)` to
+/// most of its errors. Parsing it is what turns a finding into a fix: an
+/// editor can offer to replace the name, which is the difference between a red
+/// squiggle and a resolved one.
+pub fn suggestions(message: &str) -> Vec<String> {
+    let Some(at) = message.find("Did you mean: ") else {
+        return Vec::new();
+    };
+    let tail = &message[at + "Did you mean: ".len()..];
+    // The VM truncates its list and says so: "(+12 more)".
+    let tail = match tail.find(" (+") {
+        Some(end) => &tail[..end],
+        None => tail,
+    };
+    let mut out = Vec::new();
+    for token in tail.split(" or ").flat_map(|part| part.split(", ")) {
+        // Each suggestion is a name with its kind in parentheses:
+        // `width(obj653)`, `pow(fn280)`, `abs_pos(nil)`.
+        let name = token.split('(').next().unwrap_or("").trim();
+        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            out.push(name.to_owned());
+        } else {
+            // A shape we do not recognise: stop rather than offer nonsense.
+            return Vec::new();
+        }
+    }
+    out.dedup();
+    out
+}
+
+/// The 0-based **character** column of a whole-word occurrence of `name` in
+/// `line`.
+pub(crate) fn find_word(line: &str, name: &str) -> Option<usize> {
     let bytes = line.as_bytes();
     let mut from = 0usize;
     while let Some(at) = line[from..].find(name) {
@@ -546,7 +590,7 @@ fn find_word(line: &str, name: &str) -> Option<usize> {
         let after = at + name.len();
         let after_ok = after >= bytes.len() || !is_ident_byte(bytes[after]);
         if before_ok && after_ok {
-            return Some(at);
+            return Some(line[..at].chars().count());
         }
         from = at + 1;
     }
@@ -627,12 +671,16 @@ fn uses_net(source: &str) -> bool {
         || source.contains("net.open_url")
 }
 
-/// The 1-based line and column of a byte offset.
+/// The 1-based line of a byte offset, and the 1-based **character** column.
+///
+/// Character, not byte: a column an editor or a person reads must not jump by
+/// three when the line before the fault holds one Chinese character.
 fn line_column(source: &str, at: usize) -> (usize, usize) {
-    let before = &source[..at.min(source.len())];
+    let at = at.min(source.len());
+    let before = &source[..at];
     let line = before.matches('\n').count() + 1;
-    let column = before.rfind('\n').map(|n| at - n).unwrap_or(at + 1);
-    (line, column)
+    let line_start = before.rfind('\n').map(|n| n + 1).unwrap_or(0);
+    (line, before[line_start..].chars().count() + 1)
 }
 
 /// The nearest `manifest.json` at or above a file.
@@ -985,10 +1033,23 @@ View{
         assert_eq!(named_in_message("variable undefined_name not found in scope"), Some("undefined_name".to_owned()));
         assert_eq!(named_in_message("no getter for field Deep on type NotFound"), Some("Deep".to_owned()));
         assert_eq!(named_in_message("script evaluated to an error"), None);
+        // The VM's "Did you mean" tail, parsed into the names it offers.
+        let message = "property nosuchprop not defined on type. Did you mean: distribute(nil) or abs_pos(nil), width(obj653), height(obj656), aspect(nil) (+55 more)";
+        assert_eq!(suggestions(message), vec!["distribute", "abs_pos", "width", "height", "aspect"]);
+        let message = "variable MapView not found in scope. Did you mean: MathView(obj5322) or View(obj1436)";
+        assert_eq!(suggestions(message), vec!["MathView", "View"]);
+        // A tail we do not recognise yields nothing rather than nonsense.
+        assert!(suggestions("property x not defined on type").is_empty());
+        assert!(suggestions("Did you mean: \"quoted\"").is_empty());
         // Whole words only: `text` must not match inside `text_style`.
         let line = "    Label{text: \"ok\" text_style: 1}";
         assert_eq!(find_word(line, "text"), Some(10));
         assert_eq!(find_word(line, "style"), None);
+        // Characters, not bytes: the column must not jump past a CJK line.
+        // Two CJK characters are two columns and six bytes.
+        let cjk = "    Label{text: \"你好\" nope}";
+        assert_eq!(cjk.find("nope"), Some(25), "the byte offset");
+        assert_eq!(find_word(cjk, "nope"), Some(21), "the character column");
     }
 
     #[test]

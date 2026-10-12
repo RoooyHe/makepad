@@ -60,3 +60,10 @@ serde = ["dep:serde", "makepad-draw/serde", "makepad-derive-widget/serde"]
 # the host bridge it reads are this crate's: one revision, no skew.
 name = "splashcheck"
 path = "src/bin/splashcheck.rs"
+
+[[bin]]
+# splash-lsp: the same core as a Language Server. A separate bin because an
+# editor spawns a long-lived process with a different lifecycle from a check,
+# and it shares every line of the analysis with the command line.
+name = "splash-lsp"
+path = "src/bin/splash-lsp.rs"

@@ -240,6 +240,112 @@ fn a_session_answers_initialize_and_publishes_findings() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A second buffer, unsaved, whose only job is to be completed in: a name
+/// inside a widget's braces, a value position, and a `.` on a module.
+const COMPLETE: &str = "View{\n    width: Fill\n    Label{\n        \n    }\n    on_render: fn(){ sys. }\n}\n";
+
+/// A session that has opened `text` as an unsaved document, ready to be asked
+/// for a completion.
+fn open_buffer(session: &mut Session, name: &str, text: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("splash-lsp-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let uri = format!("file:///{}", dir.join("main.splash").display().to_string().replace('\\', "/"));
+    session.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {"textDocument": {"uri": uri, "languageId": "splash", "version": 1, "text": text}},
+        })
+        .to_string(),
+    );
+    uri
+}
+
+/// One completion request, and the reply it drew.
+fn complete(session: &mut Session, id: i64, uri: &str, line: usize, character: usize) -> serde_json::Value {
+    session.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/completion",
+            "params": {
+                "textDocument": {"uri": uri},
+                "position": {"line": line, "character": character},
+            },
+        })
+        .to_string(),
+    );
+    let reply = session.next(Duration::from_secs(20)).expect("the completion reply");
+    let value: serde_json::Value = serde_json::from_str(&reply).expect("json");
+    assert_eq!(value["id"], id, "{reply}");
+    value["result"].clone()
+}
+
+/// The labels of a completion list.
+fn labels(list: &serde_json::Value) -> Vec<String> {
+    list.as_array()
+        .expect("a completion list")
+        .iter()
+        .map(|item| item["label"].as_str().expect("a label").to_owned())
+        .collect()
+}
+
+/// One item's `label` and `detail`, so the test can say where a name came from.
+fn item(list: &serde_json::Value, label: &str) -> serde_json::Value {
+    list.as_array()
+        .expect("a completion list")
+        .iter()
+        .find(|item| item["label"] == label)
+        .unwrap_or_else(|| panic!("{label} in {list}"))
+        .clone()
+}
+
+#[test]
+fn a_session_completes_a_widgets_properties_from_the_live_registry() {
+    let mut session = Session::spawn();
+    session.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    let reply = session.next(Duration::from_secs(10)).expect("the initialize reply");
+    assert!(reply.contains("completionProvider"), "{reply}");
+
+    // An unsaved buffer: opened, never written to disk.
+    let uri = open_buffer(&mut session, "complete", COMPLETE);
+
+    // A name inside Label's braces: Label's own properties, the ones it
+    // inherits, and the families a child widget would come from.
+    let list = complete(&mut session, 2, &uri, 3, 8);
+    let names = labels(&list);
+    assert!(names.contains(&"text".to_owned()), "Label's own: {names:?}");
+    assert!(names.contains(&"width".to_owned()), "inherited from View: {names:?}");
+    assert!(names.contains(&"Label".to_owned()), "a child widget: {names:?}");
+    assert_eq!(item(&list, "text")["detail"], "Label.text", "the path it came from");
+    assert_eq!(item(&list, "Label")["detail"], "widgets.Label", "the path it came from");
+    // And nothing that does not exist: a name the registry does not hold is
+    // never offered, which is the whole point of reading it live.
+    assert!(!names.contains(&"background_color".to_owned()), "{names:?}");
+    assert!(!names.contains(&"std".to_owned()), "a module is not a widget: {names:?}");
+
+    // A value position: the type's own values.
+    let list = complete(&mut session, 3, &uri, 1, 11);
+    let names = labels(&list);
+    assert!(names.contains(&"Fill".to_owned()), "{names:?}");
+    assert!(names.contains(&"Fit".to_owned()), "{names:?}");
+    assert!(!names.contains(&"Label".to_owned()), "no widget in a value list: {names:?}");
+
+    // A `.` on a module: its members.
+    let list = complete(&mut session, 4, &uri, 5, 25);
+    let names = labels(&list);
+    assert!(names.contains(&"weather".to_owned()), "the sys module's own: {names:?}");
+    assert_eq!(item(&list, "weather")["detail"], "sys.weather", "the path it came from");
+
+    session.send(r#"{"jsonrpc":"2.0","id":5,"method":"shutdown"}"#);
+    let reply = session.next(Duration::from_secs(10)).expect("the shutdown reply");
+    assert!(reply.contains("\"result\":null"), "{reply}");
+    session.send(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    let status = session.child.wait_timeout(Duration::from_secs(10));
+    assert!(status.is_some(), "the process exits on `exit`");
+}
+
 /// `wait_timeout` is not in std; this is the small version of it.
 trait WaitTimeout {
     fn wait_timeout(&mut self, within: Duration) -> Option<()>;

@@ -1,0 +1,20 @@
+# The VM query API's promised public surface — ADR 0001 §4, App Flow #9.
+#
+# Within 1.x this surface is additive only: new functions may appear; removing
+# or reinterpreting either function, or changing the order `object_keys`
+# returns, is 2.0 and is called out in the fork's release notes.
+#
+# The fork has no CI and makepad-script is not published to crates.io, so this
+# promise is kept by hand and gated by tests/query_api_surface.rs, which runs
+# with `cargo test -p makepad-script`:
+#
+#   * it fails to COMPILE if either function is removed, renamed or reshaped
+#     (the signatures below are bound to consts in the test), and
+#   * it fails the TEST if this file stops describing the API, so a breaking
+#     change cannot land without the diff being named in the pull request.
+#
+# The fixture corpus (tests/query_corpus.txt) is the other half of the promise:
+# it records the objects each function answers about, so a change to a module's
+# members is a visible diff too.
+makepad_script::query::object_keys(heap: &ScriptHeap, object: ScriptObject) -> Vec<String>
+makepad_script::query::module_object(heap: &ScriptHeap, name: &str) -> Option<ScriptObject>

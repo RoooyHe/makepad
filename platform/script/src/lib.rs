@@ -62,6 +62,7 @@ pub mod opcodes_vars;
 pub mod pod;
 pub mod pod_heap;
 pub mod prims;
+pub mod query;
 pub mod shader;
 pub mod shader_backend;
 pub mod shader_builtins;

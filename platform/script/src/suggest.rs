@@ -625,7 +625,7 @@ fn key_to_string(heap: &ScriptHeap, key: ScriptValue) -> String {
 }
 
 /// Try to convert a ScriptValue key to a string, returns None if not possible
-fn key_to_string_opt(heap: &ScriptHeap, key: ScriptValue) -> Option<String> {
+pub(crate) fn key_to_string_opt(heap: &ScriptHeap, key: ScriptValue) -> Option<String> {
     if let Some(id) = key.as_id() {
         return id.as_string(|s| s.map(|s| s.to_string()));
     }

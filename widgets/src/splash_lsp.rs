@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::splash_complete;
 use crate::splashcheck::{self, FileReport, Severity};
+use crate::widget_async::CxSplashVmExt;
 
 /// How long after the last edit a document is checked. An editor sends a
 /// didChange per keystroke, and checking a 130 KB app takes ~200 ms: doing it
@@ -36,6 +38,9 @@ pub struct Document {
 /// The server: the open documents and the context they are checked in.
 pub struct Server {
     cx: crate::Cx,
+    /// The isolate every completion is read from — the namespace an app runs
+    /// in, allocated once and only ever read. See [`crate::splash_complete`].
+    registry_vm: crate::widget_async::SplashVmId,
     documents: BTreeMap<String, Document>,
     /// The diagnostics last published for a document. A code action needs the
     /// finding's own message — its suggestions — and re-checking the document
@@ -49,7 +54,15 @@ impl Server {
     pub fn new(debounce: Duration) -> Self {
         let mut cx = crate::Cx::new(Box::new(|_, _| {}));
         cx.with_vm(crate::script_mod);
-        Self { cx, documents: BTreeMap::new(), published: BTreeMap::new(), debounce, shutdown: false }
+        let registry_vm = splash_complete::Registry::alloc(&mut cx);
+        Self {
+            cx,
+            registry_vm,
+            documents: BTreeMap::new(),
+            published: BTreeMap::new(),
+            debounce,
+            shutdown: false,
+        }
     }
 
     /// Whether an `exit` notification arrived, and the process should end.
@@ -120,6 +133,10 @@ impl Server {
             "textDocument/definition" => {
                 let uri = string_field(&params.get("textDocument").cloned().unwrap_or(Value::Null), "uri");
                 vec![response(id, self.definitions(&uri, &params))]
+            }
+            "textDocument/completion" => {
+                let uri = string_field(&params.get("textDocument").cloned().unwrap_or(Value::Null), "uri");
+                vec![response(id, Value::Array(self.completions(&uri, &params)))]
             }
             "textDocument/documentSymbol" => {
                 let uri = string_field(&params.get("textDocument").cloned().unwrap_or(Value::Null), "uri");
@@ -250,6 +267,37 @@ impl Server {
         actions
     }
 
+    /// Every name the registry offers at a position.
+    ///
+    /// Read from the document in hand, not from the file on disk: an unsaved
+    /// buffer is what the person is typing, and a completion that needs the
+    /// file saved is a completion that arrives one save too late (issue #1,
+    /// story 15).
+    fn completions(&mut self, uri: &str, params: &Value) -> Vec<Value> {
+        let Some(document) = self.documents.get(uri) else {
+            return Vec::new();
+        };
+        let text = document.text.clone();
+        let position = params.get("position").cloned().unwrap_or(Value::Null);
+        let line = position.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as usize;
+        let character = position.get("character").and_then(|c| c.as_u64()).unwrap_or(0) as usize;
+        let mut registry = splash_complete::Registry::at(&mut self.cx, self.registry_vm);
+        splash_complete::complete(&mut registry, &text, line, character)
+            .into_iter()
+            .map(|suggestion| {
+                json!({
+                    "label": suggestion.label,
+                    "kind": suggestion.kind,
+                    "detail": suggestion.detail,
+                    // The widget families are hundreds of names and a widget's
+                    // properties are a few dozen, so the sort keeps the short
+                    // list on top instead of interleaving the two.
+                    "sortText": if suggestion.kind == KIND_CLASS { "1" } else { "0" },
+                })
+            })
+            .collect()
+    }
+
     /// Where a name is declared, for go-to-definition.
     ///
     /// A textual scan, and honestly so: the VM holds the real scopes but
@@ -317,6 +365,10 @@ impl Server {
         )
     }
 }
+
+/// LSP's completion item kind for a widget family. Kept beside the server's
+/// own kinds so the protocol's numbers live in one place.
+const KIND_CLASS: u64 = 7;
 
 /// What a declaration is, in LSP's symbol kinds.
 pub const SYMBOL_FUNCTION: u64 = 12;
@@ -389,6 +441,9 @@ fn initialize_result() -> Value {
             "codeActionProvider": true,
             "definitionProvider": true,
             "documentSymbolProvider": true,
+            // A `.` is the one character that changes the answer, so it is the
+            // one that asks without the person pausing.
+            "completionProvider": {"triggerCharacters": ["."]},
             "serverInfo": {"name": "splash-lsp", "version": env!("CARGO_PKG_VERSION")},
         }
     })
@@ -464,6 +519,14 @@ fn severity(severity: Severity) -> u64 {
     match severity {
         Severity::Error => 1,
         Severity::Warn => 2,
+    }
+}
+
+/// The isolate is ours, so it goes when the server does: a language server
+/// that stops is the one moment freeing it is free.
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.cx.free_splash_vm(self.registry_vm);
     }
 }
 
@@ -764,5 +827,87 @@ mod tests {
         assert_eq!(replies[0]["error"]["code"], -32601);
         let replies = server.handle(&json!({"jsonrpc":"2.0","method":"$/setTrace","params":{}}));
         assert!(replies.is_empty());
+    }
+
+    /// The completion reply for one position: every label, with the path each
+    /// came from.
+    fn completions(server: &mut Server, uri: &str, line: usize, character: usize) -> Vec<(String, String)> {
+        let replies = server.handle(&json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "textDocument/completion",
+            "params": {"textDocument": {"uri": uri}, "position": {"line": line, "character": character}},
+        }));
+        replies[0]["result"]
+            .as_array()
+            .expect("a completion list")
+            .iter()
+            .map(|item| {
+                (
+                    item["label"].as_str().expect("a label").to_owned(),
+                    item["detail"].as_str().expect("a path").to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn initialize_offers_completion_with_a_trigger_character() {
+        let mut server = server();
+        let replies = server.handle(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+        let provider = &replies[0]["result"]["capabilities"]["completionProvider"];
+        assert_eq!(provider["triggerCharacters"], json!(["."]), "{provider}");
+    }
+
+    #[test]
+    fn a_name_in_a_widgets_braces_completes_its_properties_and_the_families() {
+        let mut server = server();
+        let uri = "file:///C:/app/bundle/main.splash";
+        // An unsaved buffer: the document was opened and never written.
+        open(&mut server, uri, "View{\n    width: Fill\n    Label{\n        \n    }\n}\n");
+        let found = completions(&mut server, uri, 3, 8);
+        let labels: Vec<&str> = found.iter().map(|(label, _)| label.as_str()).collect();
+        assert!(labels.contains(&"text"), "Label's own property: {labels:?}");
+        assert!(labels.contains(&"width"), "inherited: {labels:?}");
+        assert!(labels.contains(&"Label"), "a child widget: {labels:?}");
+        // And each item says which registry path it came from.
+        let text = found.iter().find(|(label, _)| label == "text").expect("text");
+        assert_eq!(text.1, "Label.text", "{}", text.1);
+        let label = found.iter().find(|(label, _)| label == "Label").expect("Label");
+        assert_eq!(label.1, "widgets.Label", "{}", label.1);
+    }
+
+    #[test]
+    fn a_value_position_completes_the_types_values() {
+        let mut server = server();
+        let uri = "file:///C:/app/bundle/main.splash";
+        open(&mut server, uri, "View{\n    width: \n}\n");
+        let found = completions(&mut server, uri, 1, 11);
+        let labels: Vec<&str> = found.iter().map(|(label, _)| label.as_str()).collect();
+        assert!(labels.contains(&"Fill"), "{labels:?}");
+        assert!(labels.contains(&"Fit"), "{labels:?}");
+        assert!(!labels.contains(&"Label"), "no widget in a value list: {labels:?}");
+    }
+
+    #[test]
+    fn a_dot_completes_the_receivers_names() {
+        let mut server = server();
+        let uri = "file:///C:/app/bundle/main.splash";
+        open(&mut server, uri, "View{\n    on_render: fn(){ host. }\n}\n");
+        // The character after the dot: `host` is four letters, so the dot is at
+        // column 25 and the cursor one past it.
+        let found = completions(&mut server, uri, 1, 26);
+        let labels: Vec<&str> = found.iter().map(|(label, _)| label.as_str()).collect();
+        assert!(labels.contains(&"request"), "the host bridge's own: {labels:?}");
+        // A module member says which module it is.
+        let request = found.iter().find(|(label, _)| label == "request").expect("request");
+        assert_eq!(request.1, "host.request", "{}", request.1);
+    }
+
+    #[test]
+    fn a_completion_for_an_unknown_document_is_empty() {
+        let mut server = server();
+        let found = completions(&mut server, "file:///C:/app/bundle/never-opened.splash", 0, 0);
+        assert!(found.is_empty(), "{found:?}");
     }
 }
